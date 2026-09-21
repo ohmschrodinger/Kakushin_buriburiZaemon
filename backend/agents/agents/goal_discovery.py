@@ -1,9 +1,38 @@
-"""Goal Discovery Agent — LLM extracts and structures user goals from conversation."""
+"""Goal Discovery Agent - structured extraction of explicit user goals."""
+
 from __future__ import annotations
-import json, os
-from state import ArthSaathiState
-from langchain_google_genai import ChatGoogleGenerativeAI
+
+import math
+import os
+from typing import TypedDict
+
 from langchain_core.messages import HumanMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+from state import ArthSaathiState
+
+load_dotenv()
+
+
+class ExtractedGoal(BaseModel):
+    title: str = Field(description="Short name preserving the user's stated goal")
+    target_amount: float | None = Field(default=None, description="Explicit INR amount, or null")
+    horizon_months: int | None = Field(default=None, description="Explicit timeline in months, or null")
+    priority: int | None = Field(default=None, description="Explicit priority, or null")
+
+
+class GoalExtraction(BaseModel):
+    goals: list[ExtractedGoal] = Field(default_factory=list)
+
+
+class Goal(TypedDict):
+    title: str
+    target_amount: float | None
+    horizon_months: int | None
+    priority: int
+
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-3.6-flash",
@@ -11,58 +40,103 @@ llm = ChatGoogleGenerativeAI(
     temperature=0.2,
 )
 
+
 PROMPT = """
-You are a financial goal extraction assistant for ArthSaathi, an Indian financial companion.
+You are ArthSaathi's financial goal extraction assistant.
 
-Given the user's message and financial profile, extract their financial goals.
-Return a JSON array of goals. Each goal must have:
-- title: string (short goal name in English)
-- target_amount: number or null (in INR, null if unknown)
-- horizon_months: number or null (time in months, null if unknown)
-- priority: number (1=highest priority)
+Extract only financial goals explicitly stated in the user's message.
+Do not create recommendations, defaults, or goals from the user's income,
+employment, expenses, or any other profile field. General statements such as
+"manage my money better" are not a specific goal unless the user names one.
 
-User message: {user_message}
-Monthly income: ₹{income}
-Employment: {employment}
+For every explicit goal:
+- title: short English title preserving the user's meaning
+- target_amount: explicit amount in INR, otherwise null
+- horizon_months: explicit timeline converted to months, otherwise null
+- priority: explicit priority if stated, otherwise null
 
-Return ONLY valid JSON. Example:
-[{{"title": "Emergency Fund", "target_amount": 90000, "horizon_months": 12, "priority": 1}}]
+Return an empty goals list when no explicit financial goal is present.
 
-If no clear goal is mentioned, return default goals based on their profile:
-- Emergency fund (6 months of expenses) as priority 1
-- Basic insurance enrollment as priority 2
+User message:
+{user_message}
 """
 
-async def run_goal_discovery(state: ArthSaathiState) -> list[dict]:
-    p       = state["profile"]
-    message = state.get("user_message", "") or ""
 
-    if not message.strip():
-        # Default goals when no message provided
-        expenses = float(p.get("monthlyExpenses", 0) or 0)
-        return [
-            {"title": "Emergency Fund", "target_amount": round(expenses * 6), "horizon_months": 12, "priority": 1},
-            {"title": "Accident Insurance (PMSBY)", "target_amount": None, "horizon_months": 1, "priority": 2},
-        ]
+def _conversation(state: ArthSaathiState) -> str:
+    message = state.get("user_message")
+    if isinstance(message, str) and message.strip():
+        return message.strip()
 
-    filled = PROMPT.format(
-        user_message=message,
-        income=p.get("monthlyIncome", 0),
-        employment=p.get("employmentType", "unknown"),
-    )
+    profile = state.get("profile")
+    if isinstance(profile, dict):
+        profile_message = profile.get("userMessage")
+        if isinstance(profile_message, str):
+            return profile_message.strip()
+    return ""
+
+
+def _amount(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(amount, 2) if math.isfinite(amount) and amount >= 0 else None
+
+
+def _months(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        months = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(months) if math.isfinite(months) and months >= 0 and months.is_integer() else None
+
+
+def _priority(value: object) -> int:
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        priority = float(value)
+    except (TypeError, ValueError):
+        return 0
+    return int(priority) if math.isfinite(priority) and priority > 0 and priority.is_integer() else 0
+
+
+def _normalise_goals(response: object) -> list[Goal]:
+    if isinstance(response, GoalExtraction):
+        extracted = response.goals
+    elif isinstance(response, dict):
+        extracted = GoalExtraction.model_validate(response).goals
+    else:
+        return []
+
+    goals: list[Goal] = []
+    for item in extracted:
+        title = item.title.strip()
+        if not title:
+            continue
+        goals.append({
+            "title": title,
+            "target_amount": _amount(item.target_amount),
+            "horizon_months": _months(item.horizon_months),
+            "priority": _priority(item.priority),
+        })
+    return goals
+
+
+async def run_goal_discovery(state: ArthSaathiState) -> list[Goal]:
+    user_message = _conversation(state)
+    if not user_message:
+        return []
 
     try:
-        response = await llm.ainvoke([HumanMessage(content=filled)])
-        text = response.content.strip()
-        # Strip markdown code fences if present
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        goals = json.loads(text.strip())
-        return goals if isinstance(goals, list) else []
+        extractor = llm.with_structured_output(GoalExtraction)
+        response = await extractor.ainvoke([
+            HumanMessage(content=PROMPT.format(user_message=user_message))
+        ])
+        return _normalise_goals(response)
     except Exception:
-        expenses = float(p.get("monthlyExpenses", 0) or 0)
-        return [
-            {"title": "Emergency Fund", "target_amount": round(expenses * 6), "horizon_months": 12, "priority": 1},
-        ]
+        return []
